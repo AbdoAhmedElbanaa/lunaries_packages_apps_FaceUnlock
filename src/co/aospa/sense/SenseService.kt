@@ -189,11 +189,7 @@ class SenseService : Service() {
                 try {
                     val faceIds = imageData[0] + 1
                     if (result == 0) {
-                        val faceId: Int =
-                            mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID)
-                        if (faceId > 0) {
-                            mVendorImpl!!.deleteFeature(faceId)
-                        }
+                        addEnrolledFaceId(faceIds)
                         mPreferenceHelper!!.saveIntValue(Constants.SHARED_KEY_FACE_ID, faceIds)
                         mPreferenceHelper!!.saveByteArrayValue(
                             Constants.SHARED_KEY_ENROLL_TOKEN,
@@ -293,8 +289,10 @@ class SenseService : Service() {
 
     private fun onAuthenticated() {
         try {
+            val enrolled = getEnrolledFaceIds()
+            val faceIdToSend = if (enrolled.isNotEmpty()) enrolled.first() else mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID)
             mSenseReceiver?.onAuthenticated(
-                mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID),
+                faceIdToSend,
                 mUserId,
                 mPreferenceHelper!!.getByteArrayValueByKey(
                     Constants.SHARED_KEY_ENROLL_TOKEN
@@ -399,8 +397,35 @@ class SenseService : Service() {
         }
     }
 
+    private fun getEnrolledFaceIds(): List<Int> {
+        val str = mPreferenceHelper?.getStringValueByKey("enrolled_face_ids")
+        if (!str.isNullOrEmpty()) {
+            return str.split(",").mapNotNull { it.trim().toIntOrNull() }
+        }
+        val single = mPreferenceHelper?.getIntValueByKey(Constants.SHARED_KEY_FACE_ID) ?: -1
+        return if (single > 0) listOf(single) else emptyList()
+    }
+
+    private fun addEnrolledFaceId(id: Int) {
+        val list = getEnrolledFaceIds().toMutableList()
+        if (!list.contains(id)) {
+            list.add(id)
+            mPreferenceHelper?.saveStringValue("enrolled_face_ids", list.joinToString(","))
+        }
+    }
+
+    private fun removeEnrolledFaceId(id: Int) {
+        val list = getEnrolledFaceIds().toMutableList()
+        list.remove(id)
+        mPreferenceHelper?.saveStringValue("enrolled_face_ids", list.joinToString(","))
+    }
+
+    private fun clearEnrolledFaceIds() {
+        mPreferenceHelper?.removeSharePreferences("enrolled_face_ids")
+    }
+
     private fun updateTimersAndLockout() {
-        if (mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID) > -1 && !mUserUnlocked) {
+        if (getEnrolledFaceIds().isNotEmpty() && !mUserUnlocked) {
             if (!mOnIdleTimer) {
                 cancelIdleTimer()
                 startIdleTimer()
@@ -449,13 +474,17 @@ class SenseService : Service() {
                     e.printStackTrace()
                 }
             } else {
-                mEnrollToken = cryptoToken
-                val faceId: Int = mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID)
-                if (faceId > 0) {
-                    mVendorImpl!!.deleteFeature(faceId - 1)
-                    mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_FACE_ID)
-                    mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_ENROLL_TOKEN)
+                val enrolled = getEnrolledFaceIds()
+                if (enrolled.size >= 25) {
+                    Log.w(TAG, "Maximum enrolled faces (25) reached")
+                    try {
+                        mSenseReceiver?.onError(BiometricFaceConstants.FACE_ERROR_UNABLE_TO_PROCESS, 0)
+                    } catch (e: RemoteException) {
+                        e.printStackTrace()
+                    }
+                    return
                 }
+                mEnrollToken = cryptoToken
                 resetLockoutCount()
                 mWorkHandler!!.post {
                     mVendorImpl!!.saveFeatureStart()
@@ -527,31 +556,46 @@ class SenseService : Service() {
         }
 
         override fun remove(biometricId: Int) {
-            if (Util.IS_DEBUG_LOGGING) Log.d(TAG, "remove")
+            if (Util.IS_DEBUG_LOGGING) Log.d(TAG, "remove $biometricId")
             mWorkHandler!!.post {
-                val faceId: Int = mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID)
-                if (!(biometricId == 0 || faceId == biometricId)) {
-                    Log.e(TAG, "Removing biometricId: $biometricId")
-                }
-                mVendorImpl!!.deleteFeature(faceId - 1)
-                mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_FACE_ID)
-                mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_ENROLL_TOKEN)
-                Util.setFaceUnlockAvailable(applicationContext)
-                try {
-                    if (biometricId == 0) {
-                        mSenseReceiver?.onRemoved(intArrayOf(faceId), mUserId)
-                    } else {
-                        mSenseReceiver?.onRemoved(intArrayOf(biometricId), mUserId)
+                val enrolled = getEnrolledFaceIds()
+                if (biometricId == 0) {
+                    for (id in enrolled) {
+                        mVendorImpl!!.deleteFeature(id - 1)
                     }
-                } catch (e: RemoteException) {
-                    e.printStackTrace()
+                    clearEnrolledFaceIds()
+                    mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_FACE_ID)
+                    mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_ENROLL_TOKEN)
+                    Util.setFaceUnlockAvailable(applicationContext)
+                    try {
+                        mSenseReceiver?.onRemoved(enrolled.toIntArray(), mUserId)
+                    } catch (e: RemoteException) {
+                        e.printStackTrace()
+                    }
+                } else {
+                    if (enrolled.contains(biometricId)) {
+                        mVendorImpl!!.deleteFeature(biometricId - 1)
+                        removeEnrolledFaceId(biometricId)
+                        val remaining = getEnrolledFaceIds()
+                        if (remaining.isEmpty()) {
+                            mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_FACE_ID)
+                            mPreferenceHelper!!.removeSharePreferences(Constants.SHARED_KEY_ENROLL_TOKEN)
+                        } else {
+                            mPreferenceHelper!!.saveIntValue(Constants.SHARED_KEY_FACE_ID, remaining.first())
+                        }
+                        Util.setFaceUnlockAvailable(applicationContext)
+                    }
+                    try {
+                        mSenseReceiver?.onRemoved(intArrayOf(biometricId), mUserId)
+                    } catch (e: RemoteException) {
+                        e.printStackTrace()
+                    }
                 }
             }
         }
 
         override fun enumerate(): Int {
-            val faceId: Int = mPreferenceHelper!!.getIntValueByKey(Constants.SHARED_KEY_FACE_ID)
-            val faceIds = if (faceId > -1) intArrayOf(faceId) else IntArray(0)
+            val faceIds = getEnrolledFaceIds().toIntArray()
             mWorkHandler!!.post {
                 try {
                     if (Util.IS_DEBUG_LOGGING) Log.d(TAG, "enumerate = $mSenseReceiver")
